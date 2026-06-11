@@ -1,0 +1,11 @@
+{
+  "name": "beezie-claw-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node beezie-claw-monitor.js"
+  },
+  "dependencies": {
+    "viem": "^2.21.0"
+  }
+}
