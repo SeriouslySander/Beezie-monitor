@@ -42,7 +42,7 @@ const CONFIG = {
   // Poll-tempo (adaptief)
   pollSlowMs: 5 * 60_000,   // koud: elke 5 min
   pollFastMs: 15_000,       // warm: elke 15s
-  warmMarginUsd: 8,         // 'warm' = EV binnen $8 van de drempel, of endgame actief
+  warmMarginUsd: 1,         // 'warm' = EV binnen $8 van de drempel, of endgame actief
 
   // Actieve machines (peil 7 jun 2026). Nieuwe komen automatisch binnen via factory.
   machines: [
