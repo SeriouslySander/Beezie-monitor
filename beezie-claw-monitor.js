@@ -35,6 +35,9 @@ const CONFIG = {
 
   // Alert-drempels
   evAlertUsd: 0,            // alert zodra EV per pull >= dit bedrag (0 = breakeven)
+  costPerPointAlert: 0.01,  // alert zodra kostprijs per punt <= dit bedrag ($0.01)
+  pullPtsPerUsd: 1,         // Beezie-punten per $ pull
+  swapPtsPerUsd: 1.5,       // Beezie-punten per $ swap (over bruto swap-waarde)
   grailTopN: 5,             // volg de top-N kaarten per machine als 'grails'
   endgamePoolFrac: 0.45,    // ENDGAME-alert als pool < 45% van eerste meting én grails aanwezig
   reAlertCooldownMs: 30 * 60_000,
@@ -42,7 +45,7 @@ const CONFIG = {
   // Poll-tempo (adaptief)
   pollSlowMs: 5 * 60_000,   // koud: elke 5 min
   pollFastMs: 15_000,       // warm: elke 15s
-  warmMarginUsd: 1,         // 'warm' = EV binnen $8 van de drempel, of endgame actief
+  warmMarginUsd: 8,         // 'warm' = EV binnen $8 van de drempel, of endgame actief
 
   // Actieve machines (peil 7 jun 2026). Nieuwe komen automatisch binnen via factory.
   machines: [
@@ -125,7 +128,10 @@ function stats(priceUsd, items) {
   const net = mean * (1 - CONFIG.swapFee);
   const ev = net - priceUsd;
   const winRate = vals.filter((v) => v * (1 - CONFIG.swapFee) >= priceUsd).length / n;
-  return { n, mean, ev, winRate };
+  // punten per pull+swap-lus en kostprijs per punt (house edge / punten)
+  const ptsPerLoop = priceUsd * CONFIG.pullPtsPerUsd + mean * CONFIG.swapPtsPerUsd;
+  const costPerPoint = -ev / ptsPerLoop; // negatief = je wordt betaald per punt
+  return { n, mean, ev, winRate, ptsPerLoop, costPerPoint };
 }
 
 function cooldownOk(st, key) {
@@ -176,13 +182,26 @@ async function scan(m) {
   }
 
   const grailValueLeft = [...st.grails.values()].reduce((a, g) => a + g.value, 0);
+  const cpp = s.costPerPoint;
+  const cppTxt = cpp <= 0 ? `−$${Math.abs(cpp).toFixed(3)} (betaald!)` : `$${cpp.toFixed(3)}`;
 
   // 1) EV-FLIP
   if (s.ev >= CONFIG.evAlertUsd && cooldownOk(st, "ev")) {
     await tg(
       `🟢 <b>+EV: ${m.label}</b>\nEV per pull: <b>${fmt2(s.ev)}</b> (netto, na 6% fee)\n` +
+      `Punten: ~${Math.round(s.ptsPerLoop)}/lus tegen ${cppTxt} per punt\n` +
       `Pool ${s.n} | gem swap ${fmt2(s.mean)} | winrate ${(s.winRate * 100).toFixed(1)}%\n` +
       `Grails nog aanwezig: ${fmt(grailValueLeft)}\nhttps://basescan.org/address/${addr}`
+    );
+  }
+
+  // 1b) GOEDKOPE PUNTEN: kostprijs per punt onder drempel (maar nog geen +EV)
+  if (s.ev < CONFIG.evAlertUsd && cpp <= CONFIG.costPerPointAlert && cooldownOk(st, "pts")) {
+    await tg(
+      `🪙 <b>GOEDKOPE PUNTEN: ${m.label}</b>\nKostprijs: <b>${cppTxt}</b> per punt ` +
+      `(~${Math.round(s.ptsPerLoop)} punten per pull+swap-lus)\n` +
+      `EV ${fmt2(s.ev)}/pull | pool ${s.n} | gem swap ${fmt2(s.mean)}\n` +
+      `Farm-modus: pull → direct swappen → herhalen zolang dit aanhoudt.`
     );
   }
 
@@ -198,10 +217,13 @@ async function scan(m) {
 
   console.log(
     `${m.label}: pool ${s.n} (${(frac * 100).toFixed(0)}%) | EV ${fmt2(s.ev)} | ` +
-    `grails ${st.grails.size} (${fmt(grailValueLeft)})`
+    `${cppTxt}/punt | grails ${st.grails.size} (${fmt(grailValueLeft)})`
   );
 
-  const warm = s.ev >= CONFIG.evAlertUsd - CONFIG.warmMarginUsd || frac <= CONFIG.endgamePoolFrac;
+  const warm =
+    s.ev >= CONFIG.evAlertUsd - CONFIG.warmMarginUsd ||
+    cpp <= CONFIG.costPerPointAlert * 2 ||
+    frac <= CONFIG.endgamePoolFrac;
   return warm ? CONFIG.pollFastMs : CONFIG.pollSlowMs;
 }
 
