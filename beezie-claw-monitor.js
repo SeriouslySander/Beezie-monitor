@@ -209,12 +209,24 @@ async function scan(m) {
 async function checkFactory() {
   try {
     const latest = await client.getBlockNumber();
-    if (lastFactoryBlock === 0n) lastFactoryBlock = latest - 200n;
-    const logs = await client.getLogs({
-      address: CONFIG.factory, event: clawCreated,
-      fromBlock: lastFactoryBlock + 1n, toBlock: latest,
-    });
-    lastFactoryBlock = latest;
+    if (lastFactoryBlock === 0n) lastFactoryBlock = latest - 1n;
+    // Alchemy free tier staat maar een klein blok-bereik per eth_getLogs toe:
+    // scan daarom in chunks van max 10 blokken, en max 30 chunks per ronde.
+    const CHUNK = 10n;
+    const logs = [];
+    let from = lastFactoryBlock + 1n;
+    let rounds = 0;
+    while (from <= latest && rounds < 30) {
+      const to = from + CHUNK - 1n > latest ? latest : from + CHUNK - 1n;
+      const part = await client.getLogs({
+        address: CONFIG.factory, event: clawCreated,
+        fromBlock: from, toBlock: to,
+      });
+      logs.push(...part);
+      lastFactoryBlock = to;
+      from = to + 1n;
+      rounds++;
+    }
     for (const log of logs) {
       const addr = getAddress(log.args.clawMachine);
       if (CONFIG.machines.find((m) => getAddress(m.address) === addr)) continue;
