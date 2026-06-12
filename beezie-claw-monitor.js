@@ -65,6 +65,7 @@ const CONFIG = {
 const machineAbi = parseAbi([
   "function price() view returns (uint128)",
   "function isFinished() view returns (bool)",
+  "function paused() view returns (bool)",
   "function getPrizePool() view returns ((uint48 tokenId, uint128 swapValue, uint40 timestamp)[])",
 ]);
 const erc721Abi = parseAbi([
@@ -76,6 +77,7 @@ const client = createPublicClient({ chain: base, transport: http(CONFIG.rpcUrl) 
 const usd = (v) => Number(formatUnits(v, CONFIG.usdcDecimals));
 const fmt = (n) => `$${Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
 const fmt2 = (n) => `$${Number(n).toFixed(2)}`;
+const fmtK = (n) => (n >= 1000 ? `$${(n / 1000).toFixed(1)}k` : `$${Math.round(n)}`);
 
 // state per machine
 // { initialPoolSize, grails: Map<tokenId, {value, name}>, lastAlert: {} }
@@ -109,14 +111,16 @@ async function grailName(tokenId) {
 }
 
 async function readPool(address) {
-  const [price, finished, pool] = await Promise.all([
+  const [price, finished, paused, pool] = await Promise.all([
     client.readContract({ address, abi: machineAbi, functionName: "price" }),
     client.readContract({ address, abi: machineAbi, functionName: "isFinished" }),
+    client.readContract({ address, abi: machineAbi, functionName: "paused" }),
     client.readContract({ address, abi: machineAbi, functionName: "getPrizePool" }),
   ]);
   return {
     price: usd(price),
     finished,
+    paused,
     items: pool.map((p) => ({ id: Number(p.tokenId), value: usd(p.swapValue) })),
   };
 }
@@ -146,7 +150,7 @@ async function initMachine(m) {
   const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, CONFIG.grailTopN);
   const grails = new Map();
   for (const g of top) grails.set(g.id, { value: g.value, name: await grailName(g.id) });
-  state.set(m.address, { initialPoolSize: data.items.length, grails, lastAlert: {} });
+  state.set(m.address, { initialPoolSize: data.items.length, grails, lastAlert: {}, wasPaused: data.paused, windowOpen: false });
   const s = stats(data.price, data.items);
   console.log(`init ${m.label}: pool ${s.n}, EV ${fmt2(s.ev)}, grails: ${[...grails.values()].map((g) => `${g.name} (${fmt(g.value)})`).join(" | ")}`);
   return data;
@@ -166,6 +170,54 @@ async function scan(m) {
     return CONFIG.pollSlowMs;
   }
 
+  // --- PAUZE = RESTOCK BEZIG ---
+  if (data.paused) {
+    if (!st.wasPaused) {
+      st.wasPaused = true;
+      await tg(
+        `⏸️ <b>${m.label} — restock bezig</b>\n` +
+        `Pulls onmogelijk · poolwijzigingen = beheer\n` +
+        `Actie: negeren tot heropening`
+      );
+    }
+    // Tijdens pauze: grail-verdwijningen zijn admin-verwijderingen — stil bijwerken, niet alerten.
+    const inPoolPaused = new Set(data.items.map((i) => i.id));
+    for (const [id, g] of st.grails) {
+      if (!inPoolPaused.has(id)) {
+        st.grails.delete(id);
+        console.log(`${m.label}: ⚙️ ${g.name} (${fmt(g.value)}) verwijderd tijdens restock (geen pull)`);
+      }
+    }
+    return CONFIG.pollFastMs; // snel pollen: de unpause is het meetmoment
+  }
+  if (st.wasPaused) {
+    // Unpause: venster mogelijk open. Volledige her-initialisatie + verse meting.
+    st.wasPaused = false;
+    st.initialPoolSize = data.items.length;
+    const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, CONFIG.grailTopN);
+    st.grails = new Map();
+    for (const g of top) st.grails.set(g.id, { value: g.value, name: await grailName(g.id) });
+    const sf = stats(data.price, data.items);
+    const cppF = sf.costPerPoint;
+    const cppFTxt = cppF <= 0 ? `−$${Math.abs(cppF).toFixed(3)} (betaald!)` : `$${cppF.toFixed(3)}`;
+    st.windowOpen = sf.ev >= CONFIG.evAlertUsd || cppF <= CONFIG.costPerPointAlert;
+    await tg(
+      `🔄 <b>${m.label} — weer open</b>\n` +
+      `EV ${fmt2(sf.ev)} · ${cppFTxt}/punt · pool ${sf.n} · win ${(sf.winRate * 100).toFixed(0)}%\n` +
+      `Top: ${top.slice(0, 5).map((g) => fmtK(g.value)).join(", ")}\n` +
+      (st.windowOpen ? `Actie: 🚨 opent +EV — NU kijken` : `Actie: baseline, wachten op eindspel`)
+    );
+    return CONFIG.pollFastMs;
+  }
+  // Fallback: pool groeit fors zonder dat we de pauze zagen (gemist tussen polls)
+  if (data.items.length > st.initialPoolSize * 1.15) {
+    st.initialPoolSize = data.items.length;
+    const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, CONFIG.grailTopN);
+    st.grails = new Map();
+    for (const g of top) st.grails.set(g.id, { value: g.value, name: await grailName(g.id) });
+    await tg(`🔄 <b>${m.label} — pool fors gegroeid</b>\nRestock gemist · baseline en grails ververst · pool ${data.items.length}`);
+  }
+
   const s = stats(data.price, data.items);
   const inPool = new Set(data.items.map((i) => i.id));
 
@@ -173,10 +225,11 @@ async function scan(m) {
   for (const [id, g] of st.grails) {
     if (!inPool.has(id)) {
       st.grails.delete(id);
+      const left = [...st.grails.values()].map((x) => fmtK(x.value)).join(", ") || "geen";
       await tg(
-        `🎣 <b>GRAIL GETROKKEN uit ${m.label}</b>\n${g.name} (${fmt(g.value)}) is uit de pool.\n` +
-        `Resterende grails: ${st.grails.size ? [...st.grails.values()].map((x) => `${x.name} ${fmt(x.value)}`).join(", ") : "geen"}\n` +
-        `Pool nu ${s.n} | EV ${fmt2(s.ev)}/pull`
+        `🎣 <b>${m.label} — grail eruit</b>\n` +
+        `${g.name} (${fmtK(g.value)}) getrokken\n` +
+        `Nog: ${left} · pool ${s.n} · EV ${fmt2(s.ev)}`
       );
     }
   }
@@ -187,21 +240,33 @@ async function scan(m) {
 
   // 1) EV-FLIP
   if (s.ev >= CONFIG.evAlertUsd && cooldownOk(st, "ev")) {
+    st.windowOpen = true;
     await tg(
-      `🟢 <b>+EV: ${m.label}</b>\nEV per pull: <b>${fmt2(s.ev)}</b> (netto, na 6% fee)\n` +
-      `Punten: ~${Math.round(s.ptsPerLoop)}/lus tegen ${cppTxt} per punt\n` +
-      `Pool ${s.n} | gem swap ${fmt2(s.mean)} | winrate ${(s.winRate * 100).toFixed(1)}%\n` +
-      `Grails nog aanwezig: ${fmt(grailValueLeft)}\nhttps://basescan.org/address/${addr}`
+      `🟢 <b>${m.label} — +EV OPEN</b>\n` +
+      `EV <b>${fmt2(s.ev)}</b>/pull · ${cppTxt}/punt · win ${(s.winRate * 100).toFixed(0)}%\n` +
+      `Pool ${s.n} · swap ${fmt2(s.mean)} · grails ${fmtK(grailValueLeft)}\n` +
+      `Actie: NU spelen — pulls eerst, swaps in batch`
     );
   }
 
   // 1b) GOEDKOPE PUNTEN: kostprijs per punt onder drempel (maar nog geen +EV)
   if (s.ev < CONFIG.evAlertUsd && cpp <= CONFIG.costPerPointAlert && cooldownOk(st, "pts")) {
+    st.windowOpen = true;
     await tg(
-      `🪙 <b>GOEDKOPE PUNTEN: ${m.label}</b>\nKostprijs: <b>${cppTxt}</b> per punt ` +
-      `(~${Math.round(s.ptsPerLoop)} punten per pull+swap-lus)\n` +
-      `EV ${fmt2(s.ev)}/pull | pool ${s.n} | gem swap ${fmt2(s.mean)}\n` +
-      `Farm-modus: pull → direct swappen → herhalen zolang dit aanhoudt.`
+      `🪙 <b>${m.label} — goedkope punten</b>\n` +
+      `<b>${cppTxt}</b>/punt · ~${Math.round(s.ptsPerLoop)} pt/lus · EV ${fmt2(s.ev)}\n` +
+      `Pool ${s.n} · swap ${fmt2(s.mean)}\n` +
+      `Actie: farmen (pull → swap) tot 🔒`
+    );
+  }
+
+  // 1c) VENSTER DICHT: was open, maar EV én puntenprijs zijn terug boven de drempels
+  if (st.windowOpen && s.ev < CONFIG.evAlertUsd && cpp > CONFIG.costPerPointAlert) {
+    st.windowOpen = false;
+    await tg(
+      `🔒 <b>${m.label} — venster dicht</b>\n` +
+      `EV ${fmt2(s.ev)} · ${cppTxt}/punt\n` +
+      `Actie: stoppen`
     );
   }
 
@@ -209,9 +274,10 @@ async function scan(m) {
   const frac = s.n / st.initialPoolSize;
   if (frac <= CONFIG.endgamePoolFrac && st.grails.size > 0 && cooldownOk(st, "endgame")) {
     await tg(
-      `⏳ <b>ENDGAME: ${m.label}</b>\nPool gekrompen naar ${s.n} (${(frac * 100).toFixed(0)}% van start) ` +
-      `met nog ${st.grails.size} grails t.w.v. ${fmt(grailValueLeft)} erin.\n` +
-      `EV ${fmt2(s.ev)}/pull en stijgend naarmate de pool krimpt — houd deze in de gaten.`
+      `⏳ <b>${m.label} — eindspel</b>\n` +
+      `Pool ${s.n} (${(frac * 100).toFixed(0)}% van start) · ${st.grails.size} grails ${fmtK(grailValueLeft)}\n` +
+      `EV ${fmt2(s.ev)} en stijgend\n` +
+      `Actie: standby, flip kan komen`
     );
   }
 
@@ -259,8 +325,9 @@ async function checkFactory() {
       CONFIG.machines.push(m);
       await initMachine(m).catch(() => {});
       await tg(
-        `🆕 <b>Nieuwe ${fmt(data.price)} machine live</b>\nVolle pool: ${s.n} kaarten | EV ${fmt2(s.ev)}/pull\n` +
-        `https://basescan.org/address/${addr}`
+        `🆕 <b>${fmt(data.price)} — nieuwe machine</b>\n` +
+        `Pool ${s.n} · EV ${fmt2(s.ev)}\n` +
+        `Actie: baseline, ik volg hem vanaf nu`
       );
     }
   } catch (e) { console.error("factory:", e.message); }
