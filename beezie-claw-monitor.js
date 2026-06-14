@@ -128,14 +128,24 @@ async function readPool(address) {
 function stats(priceUsd, items) {
   const n = items.length;
   const vals = items.map((i) => i.value);
+  const sorted = [...vals].sort((a, b) => a - b);
   const mean = vals.reduce((a, b) => a + b, 0) / n;
   const net = mean * (1 - CONFIG.swapFee);
   const ev = net - priceUsd;
   const winRate = vals.filter((v) => v * (1 - CONFIG.swapFee) >= priceUsd).length / n;
+  // mediaan en modale netto-uitkomst per pull (wat je 'meestal' krijgt)
+  const medianVal = sorted[Math.floor(n / 2)];
+  const medianNet = medianVal * (1 - CONFIG.swapFee) - priceUsd;
+  const freq = new Map();
+  for (const v of vals) freq.set(v, (freq.get(v) || 0) + 1);
+  let modeVal = vals[0], modeCnt = 0;
+  for (const [v, c] of freq) if (c > modeCnt) { modeCnt = c; modeVal = v; }
+  const modeNet = modeVal * (1 - CONFIG.swapFee) - priceUsd;
+  const modeShare = modeCnt / n;
   // punten per pull+swap-lus en kostprijs per punt (house edge / punten)
   const ptsPerLoop = priceUsd * CONFIG.pullPtsPerUsd + mean * CONFIG.swapPtsPerUsd;
-  const costPerPoint = -ev / ptsPerLoop; // negatief = je wordt betaald per punt
-  return { n, mean, ev, winRate, ptsPerLoop, costPerPoint };
+  const costPerPoint = -ev / ptsPerLoop;
+  return { n, mean, ev, winRate, ptsPerLoop, costPerPoint, medianNet, modeVal, modeNet, modeShare };
 }
 
 function cooldownOk(st, key) {
@@ -175,9 +185,9 @@ async function scan(m) {
     if (!st.wasPaused) {
       st.wasPaused = true;
       await tg(
-        `⏸️ <b>${m.label} — restock bezig</b>\n` +
-        `Pulls onmogelijk · poolwijzigingen = beheer\n` +
-        `Actie: negeren tot heropening`
+        `⏸️ <b>${m.label} — wordt bijgevuld</b>\n` +
+        `Spelen kan nu niet · wijzigingen zijn van Beezie zelf\n` +
+        `Doen: negeren tot hij weer opengaat`
       );
     }
     // Tijdens pauze: grail-verdwijningen zijn admin-verwijderingen — stil bijwerken, niet alerten.
@@ -203,9 +213,9 @@ async function scan(m) {
     st.windowOpen = sf.ev >= CONFIG.evAlertUsd || cppF <= CONFIG.costPerPointAlert;
     await tg(
       `🔄 <b>${m.label} — weer open</b>\n` +
-      `EV ${fmt2(sf.ev)} · ${cppFTxt}/punt · pool ${sf.n} · win ${(sf.winRate * 100).toFixed(0)}%\n` +
-      `Top: ${top.slice(0, 5).map((g) => fmtK(g.value)).join(", ")}\n` +
-      (st.windowOpen ? `Actie: 🚨 opent +EV — NU kijken` : `Actie: baseline, wachten op eindspel`)
+      `Gemiddeld ${fmt2(sf.ev)}/keer · ${cppFTxt} per punt · pool ${sf.n}\n` +
+      `Topkaarten: ${top.slice(0, 5).map((g) => fmtK(g.value)).join(", ")}\n` +
+      (st.windowOpen ? `🚨 Doen: meteen kijken, opent gunstig` : `Doen: nog niet interessant, wachten tot hij bijna leeg is`)
     );
     return CONFIG.pollFastMs;
   }
@@ -215,7 +225,7 @@ async function scan(m) {
     const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, CONFIG.grailTopN);
     st.grails = new Map();
     for (const g of top) st.grails.set(g.id, { value: g.value, name: await grailName(g.id) });
-    await tg(`🔄 <b>${m.label} — pool fors gegroeid</b>\nRestock gemist · baseline en grails ververst · pool ${data.items.length}`);
+    await tg(`🔄 <b>${m.label} — net bijgevuld</b>\nPool weer ${data.items.length} · topkaarten opnieuw ingeladen`);
   }
 
   const s = stats(data.price, data.items);
@@ -227,9 +237,9 @@ async function scan(m) {
       st.grails.delete(id);
       const left = [...st.grails.values()].map((x) => fmtK(x.value)).join(", ") || "geen";
       await tg(
-        `🎣 <b>${m.label} — grail eruit</b>\n` +
-        `${g.name} (${fmtK(g.value)}) getrokken\n` +
-        `Nog: ${left} · pool ${s.n} · EV ${fmt2(s.ev)}`
+        `🎣 <b>${m.label} — topkaart eruit</b>\n` +
+        `${g.name} (${fmtK(g.value)}) is getrokken\n` +
+        `Nog over: ${left} · pool ${s.n} · gemiddeld ${fmt2(s.ev)}/keer`
       );
     }
   }
@@ -242,10 +252,11 @@ async function scan(m) {
   if (s.ev >= CONFIG.evAlertUsd && cooldownOk(st, "ev")) {
     st.windowOpen = true;
     await tg(
-      `🟢 <b>${m.label} — +EV OPEN</b>\n` +
-      `EV <b>${fmt2(s.ev)}</b>/pull · ${cppTxt}/punt · win ${(s.winRate * 100).toFixed(0)}%\n` +
-      `Pool ${s.n} · swap ${fmt2(s.mean)} · grails ${fmtK(grailValueLeft)}\n` +
-      `Actie: NU spelen — pulls eerst, swaps in batch`
+      `🟢 <b>${m.label} — nu gunstig</b>\n` +
+      `Gemiddeld <b>${fmt2(s.ev)}</b>/keer · ${cppTxt}/punt · ${(s.winRate * 100).toFixed(0)}% kans op winst\n` +
+      `Maar meestal trek je ${fmtK(s.modeVal)} = ${fmt2(s.modeNet)} (${(s.modeShare * 100).toFixed(0)}% v.d. keren)\n` +
+      `Pool ${s.n} · grails nog erin ${fmtK(grailValueLeft)}\n` +
+      `Doen: spelen — eerst trekken, daarna swaps afhandelen`
     );
   }
 
@@ -253,10 +264,11 @@ async function scan(m) {
   if (s.ev < CONFIG.evAlertUsd && cpp <= CONFIG.costPerPointAlert && cooldownOk(st, "pts")) {
     st.windowOpen = true;
     await tg(
-      `🪙 <b>${m.label} — goedkope punten</b>\n` +
-      `<b>${cppTxt}</b>/punt · ~${Math.round(s.ptsPerLoop)} pt/lus · EV ${fmt2(s.ev)}\n` +
-      `Pool ${s.n} · swap ${fmt2(s.mean)}\n` +
-      `Actie: farmen (pull → swap) tot 🔒`
+      `🪙 <b>${m.label} — punten goedkoop</b>\n` +
+      `<b>${cppTxt}</b> per punt · ~${Math.round(s.ptsPerLoop)} punten per keer\n` +
+      `Maar meestal trek je ${fmtK(s.modeVal)} = ${fmt2(s.modeNet)} (${(s.modeShare * 100).toFixed(0)}% v.d. keren)\n` +
+      `Pool ${s.n}\n` +
+      `Doen: punten sprokkelen (trekken → swappen) tot het 🔒-bericht`
     );
   }
 
@@ -264,9 +276,9 @@ async function scan(m) {
   if (st.windowOpen && s.ev < CONFIG.evAlertUsd && cpp > CONFIG.costPerPointAlert) {
     st.windowOpen = false;
     await tg(
-      `🔒 <b>${m.label} — venster dicht</b>\n` +
-      `EV ${fmt2(s.ev)} · ${cppTxt}/punt\n` +
-      `Actie: stoppen`
+      `🔒 <b>${m.label} — niet meer gunstig</b>\n` +
+      `Gemiddeld ${fmt2(s.ev)}/keer · ${cppTxt} per punt\n` +
+      `Doen: stoppen`
     );
   }
 
@@ -274,16 +286,16 @@ async function scan(m) {
   const frac = s.n / st.initialPoolSize;
   if (frac <= CONFIG.endgamePoolFrac && st.grails.size > 0 && cooldownOk(st, "endgame")) {
     await tg(
-      `⏳ <b>${m.label} — eindspel</b>\n` +
-      `Pool ${s.n} (${(frac * 100).toFixed(0)}% van start) · ${st.grails.size} grails ${fmtK(grailValueLeft)}\n` +
-      `EV ${fmt2(s.ev)} en stijgend\n` +
-      `Actie: standby, flip kan komen`
+      `⏳ <b>${m.label} — bijna leeg, let op</b>\n` +
+      `Nog ${s.n} kaarten (${(frac * 100).toFixed(0)}% over) · ${st.grails.size} topkaarten ${fmtK(grailValueLeft)} nog erin\n` +
+      `Gemiddeld ${fmt2(s.ev)}/keer en verbetert naarmate hij leegloopt\n` +
+      `Doen: klaarzitten, kan zo gunstig worden`
     );
   }
 
   console.log(
     `${m.label}: pool ${s.n} (${(frac * 100).toFixed(0)}%) | EV ${fmt2(s.ev)} | ` +
-    `${cppTxt}/punt | grails ${st.grails.size} (${fmt(grailValueLeft)})`
+    `mediaan ${fmt2(s.medianNet)} | ${cppTxt}/punt | grails ${st.grails.size} (${fmt(grailValueLeft)})`
   );
 
   const warm =
@@ -325,9 +337,9 @@ async function checkFactory() {
       CONFIG.machines.push(m);
       await initMachine(m).catch(() => {});
       await tg(
-        `🆕 <b>${fmt(data.price)} — nieuwe machine</b>\n` +
-        `Pool ${s.n} · EV ${fmt2(s.ev)}\n` +
-        `Actie: baseline, ik volg hem vanaf nu`
+        `🆕 <b>Nieuwe machine van ${fmt(data.price)}</b>\n` +
+        `Pool ${s.n} · gemiddeld ${fmt2(s.ev)}/keer\n` +
+        `Doen: nog niet interessant, ik houd hem in de gaten`
       );
     }
   } catch (e) { console.error("factory:", e.message); }
