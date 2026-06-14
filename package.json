@@ -1,11 +1,14 @@
 {
   "name": "beezie-claw-monitor",
-  "version": "1.0.0",
+  "version": "2.0.0",
+  "description": "Onchain monitor + Telegram-bot voor Beezie claw-machines op Base",
   "type": "module",
+  "main": "beezie-claw-monitor.js",
   "scripts": {
     "start": "node beezie-claw-monitor.js"
   },
   "dependencies": {
-    "viem": "^2.21.0"
+    "viem": "^2.21.0",
+    "grammy": "^1.30.0"
   }
 }

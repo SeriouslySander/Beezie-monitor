@@ -1,19 +1,19 @@
 /**
  * beezie-claw-monitor.js
  * ----------------------
- * Onchain +EV-detector voor Beezie claw-machines op Base.
+ * Onchain monitor voor Beezie claw-machines op Base, met Telegram-bot.
  *
- * Alerts via Telegram bij:
- *  1. EV-FLIP    — netto EV per pull (na swap-fee) wordt positief op een machine
- *  2. GRAIL      — een gevolgde grail (top-kaart) verdwijnt uit de pool (getrokken!)
- *  3. ENDGAME    — pool krimpt onder een drempel terwijl er nog grails in zitten
- *  4. NIEUW      — de factory zet een verse machine live (vol = alle grails aanwezig)
+ * Twee losse delen in één proces:
+ *   1. MONITOR  — scant de machines en stuurt vanzelf alerts (gunstig, topkaart eruit,
+ *                 bijna leeg, bijvullen, nieuwe machine).
+ *   2. CHAT-BOT — luistert via grammY naar commando's en antwoordt direct:
+ *                 /status /machine /budget /best /breakeven /help
  *
- * Alles komt rechtstreeks uit de contracten: getPrizePool() geeft per kaart de
- * exacte swapValue. Geen frontend, geen schattingen.
+ * Alles komt rechtstreeks uit de contracten (getPrizePool geeft per kaart de
+ * exacte swap-waarde). Geen frontend, geen schattingen.
  *
  * Setup:
- *   npm init -y && npm pkg set type=module && npm i viem
+ *   npm init -y && npm pkg set type=module && npm i viem grammy
  *   export BASE_RPC_URL="https://base-mainnet.g.alchemy.com/v2/JOUW_KEY"
  *   export TELEGRAM_BOT_TOKEN="..."  TELEGRAM_CHAT_ID="..."
  *   node beezie-claw-monitor.js
@@ -21,6 +21,7 @@
 
 import { createPublicClient, http, parseAbi, parseAbiItem, formatUnits, getAddress } from "viem";
 import { base } from "viem/chains";
+import { Bot } from "grammy";
 
 // ---------------------------------------------------------------------------
 // CONFIG
@@ -33,21 +34,20 @@ const CONFIG = {
   swapFee: 0.06,            // 6% fee op buyback-swap
   usdcDecimals: 6,
 
-  // Alert-drempels
-  evAlertUsd: 0,            // alert zodra EV per pull >= dit bedrag (0 = breakeven)
-  costPerPointAlert: 0.01,  // alert zodra kostprijs per punt <= dit bedrag ($0.01)
-  pullPtsPerUsd: 1,         // Beezie-punten per $ pull
-  swapPtsPerUsd: 1.5,       // Beezie-punten per $ swap (over bruto swap-waarde)
-  grailTopN: 5,             // volg de top-N kaarten per machine als 'grails'
-  endgamePoolFrac: 0.45,    // ENDGAME-alert als pool < 45% van eerste meting én grails aanwezig
+  evAlertUsd: 0,            // alert zodra gemiddeld per keer >= dit bedrag (0 = breakeven)
+  costPerPointAlert: 0.01,  // alert zodra punten <= dit bedrag kosten
+  pullPtsPerUsd: 1,         // Beezie-punten per $ trekken
+  swapPtsPerUsd: 1.5,       // Beezie-punten per $ swappen
+  grailTopN: 5,             // hoeveel topkaarten per machine volgen
+  endgamePoolFrac: 0.45,    // bijna-leeg-alert als pool < 45% van de start én topkaarten erin
   reAlertCooldownMs: 30 * 60_000,
 
-  // Poll-tempo (adaptief)
-  pollSlowMs: 5 * 60_000,   // koud: elke 5 min
-  pollFastMs: 15_000,       // warm: elke 15s
-  warmMarginUsd: 8,         // 'warm' = EV binnen $8 van de drempel, of endgame actief
+  pollSlowMs: 5 * 60_000,
+  pollFastMs: 15_000,
+  warmMarginUsd: 8,
 
-  // Actieve machines (peil 7 jun 2026). Nieuwe komen automatisch binnen via factory.
+  defaultBudgetUsd: 800,    // gebruikt door /budget zonder argument
+
   machines: [
     { label: "Wildcard $30",  address: "0x99856ed47021572c0C4A26e286559A7A56f85dd2" },
     { label: "Silver $50",    address: "0x064591f28a5cDBBbd2eA9318eb4329a140DE4A1D" },
@@ -68,9 +68,7 @@ const machineAbi = parseAbi([
   "function paused() view returns (bool)",
   "function getPrizePool() view returns ((uint48 tokenId, uint128 swapValue, uint40 timestamp)[])",
 ]);
-const erc721Abi = parseAbi([
-  "function tokenURI(uint256 tokenId) view returns (string)",
-]);
+const erc721Abi = parseAbi(["function tokenURI(uint256 tokenId) view returns (string)"]);
 const clawCreated = parseAbiItem("event ClawMachineCreated(address indexed clawMachine)");
 
 const client = createPublicClient({ chain: base, transport: http(CONFIG.rpcUrl) });
@@ -78,83 +76,165 @@ const usd = (v) => Number(formatUnits(v, CONFIG.usdcDecimals));
 const fmt = (n) => `$${Number(n).toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
 const fmt2 = (n) => `$${Number(n).toFixed(2)}`;
 const fmtK = (n) => (n >= 1000 ? `$${(n / 1000).toFixed(1)}k` : `$${Math.round(n)}`);
+const cppText = (cpp) => (cpp <= 0 ? `−$${Math.abs(cpp).toFixed(3)}` : `$${cpp.toFixed(3)}`);
 
 // state per machine
-// { initialPoolSize, grails: Map<tokenId, {value, name}>, lastAlert: {} }
 const state = new Map();
 let lastFactoryBlock = 0n;
 
+// ---------------------------------------------------------------------------
+// CHAT-BOT (grammY) — luistert los van de monitor
+// ---------------------------------------------------------------------------
+const bot = CONFIG.telegram.botToken ? new Bot(CONFIG.telegram.botToken) : null;
+
+// Alert sturen (door de monitor gebruikt)
 async function tg(text) {
   console.log("[ALERT]", text.replace(/<[^>]+>/g, "").replace(/\n/g, " | "));
-  const { botToken, chatId } = CONFIG.telegram;
-  if (!botToken || !chatId) return;
+  if (!bot || !CONFIG.telegram.chatId) return;
   try {
-    await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }),
+    await bot.api.sendMessage(CONFIG.telegram.chatId, text, {
+      parse_mode: "HTML", link_preview_options: { is_disabled: true },
     });
   } catch (e) { console.error("telegram:", e.message); }
 }
 
-// --- Inkomende commando's (/status, /pools, /help) ---
-let lastUpdateId = 0;
-async function pollCommands() {
-  const { botToken } = CONFIG.telegram;
-  if (!botToken) return;
-  try {
-    const res = await fetch(
-      `https://api.telegram.org/bot${botToken}/getUpdates?offset=${lastUpdateId + 1}&timeout=0`
-    ).then((r) => r.json());
-    if (!res.ok) return;
-    for (const upd of res.result) {
-      lastUpdateId = upd.update_id;
-      const text = (upd.message?.text || "").trim().toLowerCase();
-      if (text === "/status" || text === "/pools") {
-        await sendStatus();
-      } else if (text === "/help" || text === "/start") {
-        await tg(
-          `<b>Commando's</b>\n` +
-          `/status — alle machines nu uitlezen\n` +
-          `/help — deze lijst\n` +
-          `Daarnaast krijg je vanzelf bericht bij gunstige momenten, topkaarten, bijna-leeg en bijvullen.`
+// Vind een machine op losse naam ("platinum", "gold", ...)
+function findMachine(arg) {
+  if (!arg) return null;
+  const a = arg.toLowerCase();
+  return CONFIG.machines.find((m) => m.label.toLowerCase().includes(a)) || null;
+}
+
+if (bot) {
+  bot.command(["status", "pools"], async (ctx) => {
+    const lines = ["📊 <b>Stand nu</b>"];
+    for (const m of CONFIG.machines) {
+      try {
+        const d = await readPool(getAddress(m.address));
+        if (d.finished || d.items.length === 0) { lines.push(`\n<b>${m.label}</b>: leeg`); continue; }
+        if (d.paused) { lines.push(`\n<b>${m.label}</b>: ⏸️ wordt bijgevuld (${d.items.length} kaarten)`); continue; }
+        const s = stats(d.price, d.items);
+        const top = [...d.items].sort((a, b) => b.value - a.value).slice(0, 3).map((i) => fmtK(i.value));
+        const flag = s.ev >= 0 ? "🟢 " : s.costPerPoint <= CONFIG.costPerPointAlert ? "🪙 " : "";
+        lines.push(
+          `\n${flag}<b>${m.label}</b>: ${d.items.length} kaarten\n` +
+          `gemiddeld ${fmt2(s.ev)}/keer · meestal ${fmt2(s.modeNet)} · ${cppText(s.costPerPoint)}/punt\n` +
+          `top: ${top.join(", ")}`
         );
-      }
+      } catch { lines.push(`\n<b>${m.label}</b>: leesfout`); }
     }
-  } catch (e) { console.error("commando-poll:", e.message); }
-}
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  });
 
-// Leest alle gevolgde machines live uit en stuurt een overzicht
-async function sendStatus() {
-  const lines = ["📊 <b>Stand nu</b>"];
-  for (const m of CONFIG.machines) {
+  bot.command("machine", async (ctx) => {
+    const m = findMachine(ctx.match);
+    if (!m) return ctx.reply("Welke? Bijv: /machine platinum");
     try {
-      const data = await readPool(getAddress(m.address));
-      if (data.finished || data.items.length === 0) {
-        lines.push(`\n<b>${m.label}</b>: leeg`);
-        continue;
-      }
-      if (data.paused) {
-        lines.push(`\n<b>${m.label}</b>: ⏸️ wordt bijgevuld (${data.items.length} kaarten)`);
-        continue;
-      }
-      const s = stats(data.price, data.items);
-      const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, 3).map((i) => fmtK(i.value));
-      const cpp = s.costPerPoint;
-      const cppTxt = cpp <= 0 ? `−$${Math.abs(cpp).toFixed(3)}` : `$${cpp.toFixed(3)}`;
-      const flag = s.ev >= 0 ? "🟢 " : cpp <= CONFIG.costPerPointAlert ? "🪙 " : "";
-      lines.push(
-        `\n${flag}<b>${m.label}</b>: ${data.items.length} kaarten\n` +
-        `gemiddeld ${fmt2(s.ev)}/keer · meestal ${fmt2(s.modeNet)} · ${cppTxt}/punt\n` +
-        `top: ${top.join(", ")}`
+      const d = await readPool(getAddress(m.address));
+      if (d.paused) return ctx.reply(`${m.label}: ⏸️ wordt nu bijgevuld (${d.items.length} kaarten).`);
+      if (d.items.length === 0) return ctx.reply(`${m.label}: leeg.`);
+      const s = stats(d.price, d.items);
+      const sorted = [...d.items].sort((a, b) => b.value - a.value);
+      const breakeven = d.price / (1 - CONFIG.swapFee);
+      const topList = sorted.slice(0, 5).map((i) => `• ${fmtK(i.value)}`).join("\n");
+      await ctx.reply(
+        `<b>${m.label}</b> — ${d.items.length} kaarten\n` +
+        `Inzet ${fmt(d.price)} · gemiddeld <b>${fmt2(s.ev)}</b>/keer · ${cppText(s.costPerPoint)}/punt\n` +
+        `Meestal trek je ${fmtK(s.modeVal)} (${(s.modeShare * 100).toFixed(0)}% v.d. keren) = ${fmt2(s.modeNet)}\n` +
+        `Kans op winst: ${(s.winRate * 100).toFixed(0)}%\n` +
+        `Gunstig zodra de gemiddelde kaart boven ${fmt2(breakeven)} komt (nu ${fmt2(s.mean)})\n` +
+        `\nDuurste kaarten nu:\n${topList}`,
+        { parse_mode: "HTML" }
       );
-    } catch (e) {
-      lines.push(`\n<b>${m.label}</b>: leesfout`);
+    } catch (e) { await ctx.reply(`Leesfout: ${e.message}`); }
+  });
+
+  bot.command("budget", async (ctx) => {
+    const budget = Number(ctx.match) > 0 ? Number(ctx.match) : CONFIG.defaultBudgetUsd;
+    const lines = [`💰 <b>Met ${fmt(budget)}</b>`];
+    for (const m of CONFIG.machines) {
+      try {
+        const d = await readPool(getAddress(m.address));
+        if (d.paused || d.items.length === 0) { lines.push(`\n<b>${m.label}</b>: niet speelbaar nu`); continue; }
+        const s = stats(d.price, d.items);
+        const keer = Math.floor(budget / d.price);
+        if (keer === 0) { lines.push(`\n<b>${m.label}</b>: te duur (${fmt(d.price)}/keer)`); continue; }
+        lines.push(
+          `\n<b>${m.label}</b>: ${keer}× spelen\n` +
+          `verwacht resultaat ${fmt2(s.ev * keer)} · meestal rond ${fmt2(s.modeNet * keer)}\n` +
+          `punten ~${Math.round(s.ptsPerLoop * keer)}`
+        );
+      } catch { lines.push(`\n<b>${m.label}</b>: leesfout`); }
     }
-  }
-  await tg(lines.join("\n"));
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  });
+
+  bot.command("best", async (ctx) => {
+    let rows = [];
+    for (const m of CONFIG.machines) {
+      try {
+        const d = await readPool(getAddress(m.address));
+        if (d.paused || d.items.length === 0) continue;
+        const s = stats(d.price, d.items);
+        rows.push({ label: m.label, evPct: s.ev / d.price, cpp: s.costPerPoint, ev: s.ev });
+      } catch { /* skip */ }
+    }
+    if (rows.length === 0) return ctx.reply("Geen speelbare machines nu.");
+    rows.sort((a, b) => b.evPct - a.evPct); // minst slecht eerst
+    const top = rows[0];
+    const lines = ["🎯 <b>Beste keuze nu</b>"];
+    for (const r of rows) {
+      const mark = r === top ? "👉 " : "   ";
+      lines.push(`${mark}<b>${r.label}</b>: ${fmt2(r.ev)}/keer (${(r.evPct * 100).toFixed(1)}%) · ${cppText(r.cpp)}/punt`);
+    }
+    lines.push(
+      top.ev >= 0
+        ? `\n${top.label} is nu gunstig — spelen kan.`
+        : `\nNog niets gunstig. ${top.label} is het minst slecht, maar wachten op een bericht is verstandiger.`
+    );
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  });
+
+  bot.command("breakeven", async (ctx) => {
+    const lines = ["📐 <b>Hoe ver van gunstig</b>"];
+    for (const m of CONFIG.machines) {
+      try {
+        const d = await readPool(getAddress(m.address));
+        if (d.paused || d.items.length === 0) { lines.push(`\n<b>${m.label}</b>: niet speelbaar`); continue; }
+        const s = stats(d.price, d.items);
+        const breakeven = d.price / (1 - CONFIG.swapFee);
+        const gap = breakeven - s.mean; // hoeveel de gemiddelde kaart nog omhoog moet
+        if (gap <= 0) { lines.push(`\n🟢 <b>${m.label}</b>: nu al gunstig`); continue; }
+        const cheap = d.items.filter((i) => i.value < s.mean).length;
+        lines.push(
+          `\n<b>${m.label}</b>: gemiddelde kaart ${fmt2(s.mean)}, moet naar ${fmt2(breakeven)} (+${fmt2(gap)})\n` +
+          `pool ${d.items.length} · ~${cheap} goedkope kaarten te gaan`
+        );
+      } catch { lines.push(`\n<b>${m.label}</b>: leesfout`); }
+    }
+    lines.push(`\nMeestal kantelt een machine pas in de laatste ~45%. De bot meldt het zelf zodra het zover is.`);
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  });
+
+  bot.command(["help", "start"], async (ctx) => {
+    await ctx.reply(
+      `<b>Wat ik kan</b>\n` +
+      `/status — alle machines in één blik\n` +
+      `/machine platinum — alles over één machine\n` +
+      `/budget 800 — wat kun je met dit bedrag, per machine\n` +
+      `/best — welke is nu het minst slecht / gunstig\n` +
+      `/breakeven — hoe dicht elke machine bij gunstig is\n\n` +
+      `En je krijgt vanzelf bericht bij: gunstig moment 🟢, punten goedkoop 🪙, topkaart eruit 🎣, bijna leeg ⏳, bijvullen ⏸️🔄, nieuwe machine 🆕.`,
+      { parse_mode: "HTML" }
+    );
+  });
+
+  bot.catch((err) => console.error("bot-fout:", err.message));
 }
 
+// ---------------------------------------------------------------------------
+// GEDEELDE DATA-FUNCTIES
+// ---------------------------------------------------------------------------
 async function grailName(tokenId) {
   try {
     const uri = await client.readContract({
@@ -177,8 +257,7 @@ async function readPool(address) {
   ]);
   return {
     price: usd(price),
-    finished,
-    paused,
+    finished, paused,
     items: pool.map((p) => ({ id: Number(p.tokenId), value: usd(p.swapValue) })),
   };
 }
@@ -188,22 +267,17 @@ function stats(priceUsd, items) {
   const vals = items.map((i) => i.value);
   const sorted = [...vals].sort((a, b) => a - b);
   const mean = vals.reduce((a, b) => a + b, 0) / n;
-  const net = mean * (1 - CONFIG.swapFee);
-  const ev = net - priceUsd;
+  const ev = mean * (1 - CONFIG.swapFee) - priceUsd;
   const winRate = vals.filter((v) => v * (1 - CONFIG.swapFee) >= priceUsd).length / n;
-  // mediaan en modale netto-uitkomst per pull (wat je 'meestal' krijgt)
-  const medianVal = sorted[Math.floor(n / 2)];
-  const medianNet = medianVal * (1 - CONFIG.swapFee) - priceUsd;
+  const medianNet = sorted[Math.floor(n / 2)] * (1 - CONFIG.swapFee) - priceUsd;
   const freq = new Map();
   for (const v of vals) freq.set(v, (freq.get(v) || 0) + 1);
   let modeVal = vals[0], modeCnt = 0;
   for (const [v, c] of freq) if (c > modeCnt) { modeCnt = c; modeVal = v; }
   const modeNet = modeVal * (1 - CONFIG.swapFee) - priceUsd;
-  const modeShare = modeCnt / n;
-  // punten per pull+swap-lus en kostprijs per punt (house edge / punten)
   const ptsPerLoop = priceUsd * CONFIG.pullPtsPerUsd + mean * CONFIG.swapPtsPerUsd;
   const costPerPoint = -ev / ptsPerLoop;
-  return { n, mean, ev, winRate, ptsPerLoop, costPerPoint, medianNet, modeVal, modeNet, modeShare };
+  return { n, mean, ev, winRate, ptsPerLoop, costPerPoint, medianNet, modeVal, modeNet, modeShare: modeCnt / n };
 }
 
 function cooldownOk(st, key) {
@@ -220,10 +294,13 @@ async function initMachine(m) {
   for (const g of top) grails.set(g.id, { value: g.value, name: await grailName(g.id) });
   state.set(m.address, { initialPoolSize: data.items.length, grails, lastAlert: {}, wasPaused: data.paused, windowOpen: false });
   const s = stats(data.price, data.items);
-  console.log(`init ${m.label}: pool ${s.n}, EV ${fmt2(s.ev)}, grails: ${[...grails.values()].map((g) => `${g.name} (${fmt(g.value)})`).join(" | ")}`);
+  console.log(`init ${m.label}: pool ${s.n}, gemiddeld ${fmt2(s.ev)}`);
   return data;
 }
 
+// ---------------------------------------------------------------------------
+// MONITOR-LOOP
+// ---------------------------------------------------------------------------
 async function scan(m) {
   const addr = getAddress(m.address);
   let st = state.get(m.address);
@@ -234,50 +311,37 @@ async function scan(m) {
   } catch (e) { console.error(`${m.label}: ${e.message}`); return CONFIG.pollSlowMs; }
 
   if (data.finished || data.items.length === 0) {
-    console.log(`${m.label}: finished/leeg`);
+    console.log(`${m.label}: leeg`);
     return CONFIG.pollSlowMs;
   }
 
-  // --- PAUZE = RESTOCK BEZIG ---
   if (data.paused) {
     if (!st.wasPaused) {
       st.wasPaused = true;
-      await tg(
-        `⏸️ <b>${m.label} — wordt bijgevuld</b>\n` +
-        `Spelen kan nu niet · wijzigingen zijn van Beezie zelf\n` +
-        `Doen: negeren tot hij weer opengaat`
-      );
+      await tg(`⏸️ <b>${m.label} — wordt bijgevuld</b>\nSpelen kan nu niet · wijzigingen zijn van Beezie zelf\nDoen: negeren tot hij weer opengaat`);
     }
-    // Tijdens pauze: grail-verdwijningen zijn admin-verwijderingen — stil bijwerken, niet alerten.
     const inPoolPaused = new Set(data.items.map((i) => i.id));
     for (const [id, g] of st.grails) {
-      if (!inPoolPaused.has(id)) {
-        st.grails.delete(id);
-        console.log(`${m.label}: ⚙️ ${g.name} (${fmt(g.value)}) verwijderd tijdens restock (geen pull)`);
-      }
+      if (!inPoolPaused.has(id)) { st.grails.delete(id); console.log(`${m.label}: ⚙️ ${g.name} weg tijdens bijvullen`); }
     }
-    return CONFIG.pollFastMs; // snel pollen: de unpause is het meetmoment
+    return CONFIG.pollFastMs;
   }
   if (st.wasPaused) {
-    // Unpause: venster mogelijk open. Volledige her-initialisatie + verse meting.
     st.wasPaused = false;
     st.initialPoolSize = data.items.length;
     const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, CONFIG.grailTopN);
     st.grails = new Map();
     for (const g of top) st.grails.set(g.id, { value: g.value, name: await grailName(g.id) });
     const sf = stats(data.price, data.items);
-    const cppF = sf.costPerPoint;
-    const cppFTxt = cppF <= 0 ? `−$${Math.abs(cppF).toFixed(3)} (betaald!)` : `$${cppF.toFixed(3)}`;
-    st.windowOpen = sf.ev >= CONFIG.evAlertUsd || cppF <= CONFIG.costPerPointAlert;
+    st.windowOpen = sf.ev >= CONFIG.evAlertUsd || sf.costPerPoint <= CONFIG.costPerPointAlert;
     await tg(
       `🔄 <b>${m.label} — weer open</b>\n` +
-      `Gemiddeld ${fmt2(sf.ev)}/keer · ${cppFTxt} per punt · pool ${sf.n}\n` +
+      `Gemiddeld ${fmt2(sf.ev)}/keer · ${cppText(sf.costPerPoint)} per punt · pool ${sf.n}\n` +
       `Topkaarten: ${top.slice(0, 5).map((g) => fmtK(g.value)).join(", ")}\n` +
       (st.windowOpen ? `🚨 Doen: meteen kijken, opent gunstig` : `Doen: nog niet interessant, wachten tot hij bijna leeg is`)
     );
     return CONFIG.pollFastMs;
   }
-  // Fallback: pool groeit fors zonder dat we de pauze zagen (gemist tussen polls)
   if (data.items.length > st.initialPoolSize * 1.15) {
     st.initialPoolSize = data.items.length;
     const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, CONFIG.grailTopN);
@@ -289,101 +353,69 @@ async function scan(m) {
   const s = stats(data.price, data.items);
   const inPool = new Set(data.items.map((i) => i.id));
 
-  // 2) GRAIL-alerts: gevolgde topkaart verdwenen uit de pool
   for (const [id, g] of st.grails) {
     if (!inPool.has(id)) {
       st.grails.delete(id);
       const left = [...st.grails.values()].map((x) => fmtK(x.value)).join(", ") || "geen";
-      await tg(
-        `🎣 <b>${m.label} — topkaart eruit</b>\n` +
-        `${g.name} (${fmtK(g.value)}) is getrokken\n` +
-        `Nog over: ${left} · pool ${s.n} · gemiddeld ${fmt2(s.ev)}/keer`
-      );
+      await tg(`🎣 <b>${m.label} — topkaart eruit</b>\n${g.name} (${fmtK(g.value)}) is getrokken\nNog over: ${left} · pool ${s.n} · gemiddeld ${fmt2(s.ev)}/keer`);
     }
   }
 
   const grailValueLeft = [...st.grails.values()].reduce((a, g) => a + g.value, 0);
   const cpp = s.costPerPoint;
-  const cppTxt = cpp <= 0 ? `−$${Math.abs(cpp).toFixed(3)} (betaald!)` : `$${cpp.toFixed(3)}`;
 
-  // 1) EV-FLIP
   if (s.ev >= CONFIG.evAlertUsd && cooldownOk(st, "ev")) {
     st.windowOpen = true;
     await tg(
       `🟢 <b>${m.label} — nu gunstig</b>\n` +
-      `Gemiddeld <b>${fmt2(s.ev)}</b>/keer · ${cppTxt}/punt · ${(s.winRate * 100).toFixed(0)}% kans op winst\n` +
+      `Gemiddeld <b>${fmt2(s.ev)}</b>/keer · ${cppText(cpp)}/punt · ${(s.winRate * 100).toFixed(0)}% kans op winst\n` +
       `Maar meestal trek je ${fmtK(s.modeVal)} = ${fmt2(s.modeNet)} (${(s.modeShare * 100).toFixed(0)}% v.d. keren)\n` +
-      `Pool ${s.n} · grails nog erin ${fmtK(grailValueLeft)}\n` +
+      `Pool ${s.n} · topkaarten nog erin ${fmtK(grailValueLeft)}\n` +
       `Doen: spelen — eerst trekken, daarna swaps afhandelen`
     );
   }
 
-  // 1b) GOEDKOPE PUNTEN: kostprijs per punt onder drempel (maar nog geen +EV)
   if (s.ev < CONFIG.evAlertUsd && cpp <= CONFIG.costPerPointAlert && cooldownOk(st, "pts")) {
     st.windowOpen = true;
     await tg(
       `🪙 <b>${m.label} — punten goedkoop</b>\n` +
-      `<b>${cppTxt}</b> per punt · ~${Math.round(s.ptsPerLoop)} punten per keer\n` +
+      `<b>${cppText(cpp)}</b> per punt · ~${Math.round(s.ptsPerLoop)} punten per keer\n` +
       `Maar meestal trek je ${fmtK(s.modeVal)} = ${fmt2(s.modeNet)} (${(s.modeShare * 100).toFixed(0)}% v.d. keren)\n` +
-      `Pool ${s.n}\n` +
-      `Doen: punten sprokkelen (trekken → swappen) tot het 🔒-bericht`
+      `Pool ${s.n}\nDoen: punten sprokkelen (trekken → swappen) tot het 🔒-bericht`
     );
   }
 
-  // 1c) VENSTER DICHT: was open, maar EV én puntenprijs zijn terug boven de drempels
   if (st.windowOpen && s.ev < CONFIG.evAlertUsd && cpp > CONFIG.costPerPointAlert) {
     st.windowOpen = false;
-    await tg(
-      `🔒 <b>${m.label} — niet meer gunstig</b>\n` +
-      `Gemiddeld ${fmt2(s.ev)}/keer · ${cppTxt} per punt\n` +
-      `Doen: stoppen`
-    );
+    await tg(`🔒 <b>${m.label} — niet meer gunstig</b>\nGemiddeld ${fmt2(s.ev)}/keer · ${cppText(cpp)} per punt\nDoen: stoppen`);
   }
 
-  // 3) ENDGAME: pool sterk gekrompen, grails nog binnen
   const frac = s.n / st.initialPoolSize;
   if (frac <= CONFIG.endgamePoolFrac && st.grails.size > 0 && cooldownOk(st, "endgame")) {
     await tg(
       `⏳ <b>${m.label} — bijna leeg, let op</b>\n` +
       `Nog ${s.n} kaarten (${(frac * 100).toFixed(0)}% over) · ${st.grails.size} topkaarten ${fmtK(grailValueLeft)} nog erin\n` +
-      `Gemiddeld ${fmt2(s.ev)}/keer en verbetert naarmate hij leegloopt\n` +
-      `Doen: klaarzitten, kan zo gunstig worden`
+      `Gemiddeld ${fmt2(s.ev)}/keer en verbetert naarmate hij leegloopt\nDoen: klaarzitten, kan zo gunstig worden`
     );
   }
 
-  console.log(
-    `${m.label}: pool ${s.n} (${(frac * 100).toFixed(0)}%) | EV ${fmt2(s.ev)} | ` +
-    `mediaan ${fmt2(s.medianNet)} | ${cppTxt}/punt | grails ${st.grails.size} (${fmt(grailValueLeft)})`
-  );
+  console.log(`${m.label}: pool ${s.n} (${(frac * 100).toFixed(0)}%) | gemiddeld ${fmt2(s.ev)} | meestal ${fmt2(s.modeNet)} | ${cppText(cpp)}/punt`);
 
-  const warm =
-    s.ev >= CONFIG.evAlertUsd - CONFIG.warmMarginUsd ||
-    cpp <= CONFIG.costPerPointAlert * 2 ||
-    frac <= CONFIG.endgamePoolFrac;
+  const warm = s.ev >= CONFIG.evAlertUsd - CONFIG.warmMarginUsd || cpp <= CONFIG.costPerPointAlert * 2 || frac <= CONFIG.endgamePoolFrac;
   return warm ? CONFIG.pollFastMs : CONFIG.pollSlowMs;
 }
 
-// 4) NIEUWE machines via factory
 async function checkFactory() {
   try {
     const latest = await client.getBlockNumber();
     if (lastFactoryBlock === 0n) lastFactoryBlock = latest - 1n;
-    // Alchemy free tier staat maar een klein blok-bereik per eth_getLogs toe:
-    // scan daarom in chunks van max 10 blokken, en max 30 chunks per ronde.
     const CHUNK = 10n;
     const logs = [];
-    let from = lastFactoryBlock + 1n;
-    let rounds = 0;
+    let from = lastFactoryBlock + 1n, rounds = 0;
     while (from <= latest && rounds < 30) {
       const to = from + CHUNK - 1n > latest ? latest : from + CHUNK - 1n;
-      const part = await client.getLogs({
-        address: CONFIG.factory, event: clawCreated,
-        fromBlock: from, toBlock: to,
-      });
-      logs.push(...part);
-      lastFactoryBlock = to;
-      from = to + 1n;
-      rounds++;
+      logs.push(...await client.getLogs({ address: CONFIG.factory, event: clawCreated, fromBlock: from, toBlock: to }));
+      lastFactoryBlock = to; from = to + 1n; rounds++;
     }
     for (const log of logs) {
       const addr = getAddress(log.args.clawMachine);
@@ -394,30 +426,25 @@ async function checkFactory() {
       const m = { label: `${fmt(data.price)} (nieuw)`, address: addr };
       CONFIG.machines.push(m);
       await initMachine(m).catch(() => {});
-      await tg(
-        `🆕 <b>Nieuwe machine van ${fmt(data.price)}</b>\n` +
-        `Pool ${s.n} · gemiddeld ${fmt2(s.ev)}/keer\n` +
-        `Doen: nog niet interessant, ik houd hem in de gaten`
-      );
+      await tg(`🆕 <b>Nieuwe machine van ${fmt(data.price)}</b>\nPool ${s.n} · gemiddeld ${fmt2(s.ev)}/keer\nDoen: nog niet interessant, ik houd hem in de gaten`);
     }
   } catch (e) { console.error("factory:", e.message); }
 }
 
-async function main() {
-  console.log(`Beezie claw-monitor — ${CONFIG.machines.length} machines, EV-drempel ${fmt2(CONFIG.evAlertUsd)}, grail top-${CONFIG.grailTopN}\n`);
+async function monitorLoop() {
+  console.log(`Monitor gestart — ${CONFIG.machines.length} machines\n`);
   for (const m of CONFIG.machines) await initMachine(m).catch((e) => console.error(`init ${m.label}: ${e.message}`));
-  await pollCommands(); // bestaande commando's wegwerken zodat oude /status niet alles triggert
   for (;;) {
     await checkFactory();
     let delay = CONFIG.pollSlowMs;
     for (const m of CONFIG.machines) delay = Math.min(delay, await scan(m));
     console.log(`— volgende scan over ${Math.round(delay / 1000)}s —\n`);
-    // Wacht in stukjes van 3s en luister ondertussen naar commando's
-    const until = Date.now() + delay;
-    while (Date.now() < until) {
-      await pollCommands();
-      await new Promise((r) => setTimeout(r, 3000));
-    }
+    await new Promise((r) => setTimeout(r, delay));
   }
 }
-main().catch((e) => { console.error(e); process.exit(1); });
+
+// ---------------------------------------------------------------------------
+// START: chat-bot en monitor draaien onafhankelijk naast elkaar
+// ---------------------------------------------------------------------------
+if (bot) bot.start({ onStart: () => console.log("Chat-bot luistert (long polling).") });
+monitorLoop().catch((e) => { console.error(e); process.exit(1); });
