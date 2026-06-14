@@ -97,6 +97,64 @@ async function tg(text) {
   } catch (e) { console.error("telegram:", e.message); }
 }
 
+// --- Inkomende commando's (/status, /pools, /help) ---
+let lastUpdateId = 0;
+async function pollCommands() {
+  const { botToken } = CONFIG.telegram;
+  if (!botToken) return;
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${botToken}/getUpdates?offset=${lastUpdateId + 1}&timeout=0`
+    ).then((r) => r.json());
+    if (!res.ok) return;
+    for (const upd of res.result) {
+      lastUpdateId = upd.update_id;
+      const text = (upd.message?.text || "").trim().toLowerCase();
+      if (text === "/status" || text === "/pools") {
+        await sendStatus();
+      } else if (text === "/help" || text === "/start") {
+        await tg(
+          `<b>Commando's</b>\n` +
+          `/status — alle machines nu uitlezen\n` +
+          `/help — deze lijst\n` +
+          `Daarnaast krijg je vanzelf bericht bij gunstige momenten, topkaarten, bijna-leeg en bijvullen.`
+        );
+      }
+    }
+  } catch (e) { console.error("commando-poll:", e.message); }
+}
+
+// Leest alle gevolgde machines live uit en stuurt een overzicht
+async function sendStatus() {
+  const lines = ["📊 <b>Stand nu</b>"];
+  for (const m of CONFIG.machines) {
+    try {
+      const data = await readPool(getAddress(m.address));
+      if (data.finished || data.items.length === 0) {
+        lines.push(`\n<b>${m.label}</b>: leeg`);
+        continue;
+      }
+      if (data.paused) {
+        lines.push(`\n<b>${m.label}</b>: ⏸️ wordt bijgevuld (${data.items.length} kaarten)`);
+        continue;
+      }
+      const s = stats(data.price, data.items);
+      const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, 3).map((i) => fmtK(i.value));
+      const cpp = s.costPerPoint;
+      const cppTxt = cpp <= 0 ? `−$${Math.abs(cpp).toFixed(3)}` : `$${cpp.toFixed(3)}`;
+      const flag = s.ev >= 0 ? "🟢 " : cpp <= CONFIG.costPerPointAlert ? "🪙 " : "";
+      lines.push(
+        `\n${flag}<b>${m.label}</b>: ${data.items.length} kaarten\n` +
+        `gemiddeld ${fmt2(s.ev)}/keer · meestal ${fmt2(s.modeNet)} · ${cppTxt}/punt\n` +
+        `top: ${top.join(", ")}`
+      );
+    } catch (e) {
+      lines.push(`\n<b>${m.label}</b>: leesfout`);
+    }
+  }
+  await tg(lines.join("\n"));
+}
+
 async function grailName(tokenId) {
   try {
     const uri = await client.readContract({
@@ -348,12 +406,18 @@ async function checkFactory() {
 async function main() {
   console.log(`Beezie claw-monitor — ${CONFIG.machines.length} machines, EV-drempel ${fmt2(CONFIG.evAlertUsd)}, grail top-${CONFIG.grailTopN}\n`);
   for (const m of CONFIG.machines) await initMachine(m).catch((e) => console.error(`init ${m.label}: ${e.message}`));
+  await pollCommands(); // bestaande commando's wegwerken zodat oude /status niet alles triggert
   for (;;) {
     await checkFactory();
     let delay = CONFIG.pollSlowMs;
     for (const m of CONFIG.machines) delay = Math.min(delay, await scan(m));
     console.log(`— volgende scan over ${Math.round(delay / 1000)}s —\n`);
-    await new Promise((r) => setTimeout(r, delay));
+    // Wacht in stukjes van 3s en luister ondertussen naar commando's
+    const until = Date.now() + delay;
+    while (Date.now() < until) {
+      await pollCommands();
+      await new Promise((r) => setTimeout(r, 3000));
+    }
   }
 }
 main().catch((e) => { console.error(e); process.exit(1); });
