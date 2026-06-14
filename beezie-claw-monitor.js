@@ -1,27 +1,27 @@
 /**
  * beezie-claw-monitor.js
  * ----------------------
- * Onchain monitor voor Beezie claw-machines op Base, met Telegram-bot.
+ * Onchain monitor voor Beezie claw-machines op Base, met Telegram-bot + geheugen.
  *
- * Twee losse delen in één proces:
- *   1. MONITOR  — scant de machines en stuurt vanzelf alerts (gunstig, topkaart eruit,
- *                 bijna leeg, bijvullen, nieuwe machine).
- *   2. CHAT-BOT — luistert via grammY naar commando's en antwoordt direct:
- *                 /status /machine /budget /best /breakeven /help
- *
- * Alles komt rechtstreeks uit de contracten (getPrizePool geeft per kaart de
- * exacte swap-waarde). Geen frontend, geen schattingen.
+ * Drie delen in één proces:
+ *   1. MONITOR  — scant de machines en stuurt vanzelf alerts.
+ *   2. CHAT-BOT — grammY, luistert naar /status /machine /budget /best /breakeven /log /help.
+ *   3. GEHEUGEN — schrijft toestand + vensergeschiedenis naar schijf (data.json),
+ *                 zodat een herstart niets vergeet en je patronen kunt terugzien.
  *
  * Setup:
  *   npm init -y && npm pkg set type=module && npm i viem grammy
  *   export BASE_RPC_URL="https://base-mainnet.g.alchemy.com/v2/JOUW_KEY"
  *   export TELEGRAM_BOT_TOKEN="..."  TELEGRAM_CHAT_ID="..."
+ *   export DATA_DIR="/data"   # op Railway: koppel een Volume aan /data (anders ./data)
  *   node beezie-claw-monitor.js
  */
 
 import { createPublicClient, http, parseAbi, parseAbiItem, formatUnits, getAddress } from "viem";
 import { base } from "viem/chains";
 import { Bot } from "grammy";
+import fs from "fs";
+import path from "path";
 
 // ---------------------------------------------------------------------------
 // CONFIG
@@ -31,22 +31,26 @@ const CONFIG = {
   factory: getAddress("0x8b50bab7464764f6d102a9819b7db967256db14c"),
   collectibles: getAddress("0xbb5ec6fd4b61723bd45c399840f1d868840ca16f"),
 
-  swapFee: 0.06,            // 6% fee op buyback-swap
+  swapFee: 0.06,
   usdcDecimals: 6,
 
-  evAlertUsd: 0,            // alert zodra gemiddeld per keer >= dit bedrag (0 = breakeven)
-  costPerPointAlert: 0.01,  // alert zodra punten <= dit bedrag kosten
-  pullPtsPerUsd: 1,         // Beezie-punten per $ trekken
-  swapPtsPerUsd: 1.5,       // Beezie-punten per $ swappen
-  grailTopN: 5,             // hoeveel topkaarten per machine volgen
-  endgamePoolFrac: 0.45,    // bijna-leeg-alert als pool < 45% van de start én topkaarten erin
+  evAlertUsd: 0,
+  costPerPointAlert: 0.01,
+  pullPtsPerUsd: 1,
+  swapPtsPerUsd: 1.5,
+  grailTopN: 5,
+  endgamePoolFrac: 0.45,
   reAlertCooldownMs: 30 * 60_000,
 
   pollSlowMs: 5 * 60_000,
   pollFastMs: 15_000,
   warmMarginUsd: 8,
 
-  defaultBudgetUsd: 800,    // gebruikt door /budget zonder argument
+  defaultBudgetUsd: 800,
+
+  dataDir: process.env.DATA_DIR || "./data",
+  saveEveryMs: 60_000,          // hooguit 1× per minuut wegschrijven
+  windowLogMax: 50,             // bewaar de laatste 50 vensters
 
   machines: [
     { label: "Wildcard $30",  address: "0x99856ed47021572c0C4A26e286559A7A56f85dd2" },
@@ -78,16 +82,94 @@ const fmt2 = (n) => `$${Number(n).toFixed(2)}`;
 const fmtK = (n) => (n >= 1000 ? `$${(n / 1000).toFixed(1)}k` : `$${Math.round(n)}`);
 const cppText = (cpp) => (cpp <= 0 ? `−$${Math.abs(cpp).toFixed(3)}` : `$${cpp.toFixed(3)}`);
 
-// state per machine
+// state per machine (in geheugen) + venstergeschiedenis
 const state = new Map();
+let windowLog = [];            // [{machine, opened, closed, durationMin, bestEv, reason}]
 let lastFactoryBlock = 0n;
+let freshStart = true;         // eerste scan na (her)start: stil reconciliëren, niet alarmeren
 
 // ---------------------------------------------------------------------------
-// CHAT-BOT (grammY) — luistert los van de monitor
+// GEHEUGEN: laden en opslaan
+// ---------------------------------------------------------------------------
+const dataFile = path.join(CONFIG.dataDir, "data.json");
+let lastSave = 0;
+
+function loadState() {
+  try {
+    if (!fs.existsSync(dataFile)) { console.log("Geen opgeslagen geheugen — verse start."); return; }
+    const raw = JSON.parse(fs.readFileSync(dataFile, "utf8"));
+    windowLog = raw.windowLog || [];
+    lastFactoryBlock = raw.lastFactoryBlock ? BigInt(raw.lastFactoryBlock) : 0n;
+    for (const [addr, st] of Object.entries(raw.state || {})) {
+      state.set(addr, {
+        initialPoolSize: st.initialPoolSize,
+        grails: new Map((st.grails || []).map((g) => [g.id, { value: g.value, name: g.name }])),
+        lastAlert: st.lastAlert || {},
+        wasPaused: !!st.wasPaused,
+        windowOpen: !!st.windowOpen,
+        windowOpenedAt: st.windowOpenedAt || null,
+        windowBestEv: st.windowBestEv ?? null,
+      });
+    }
+    console.log(`Geheugen geladen: ${state.size} machines, ${windowLog.length} vensters in historie.`);
+  } catch (e) { console.error("geheugen laden mislukt:", e.message); }
+}
+
+function saveState(force = false) {
+  if (!force && Date.now() - lastSave < CONFIG.saveEveryMs) return;
+  lastSave = Date.now();
+  try {
+    fs.mkdirSync(CONFIG.dataDir, { recursive: true });
+    const out = {
+      savedAt: new Date().toISOString(),
+      lastFactoryBlock: lastFactoryBlock.toString(),
+      windowLog: windowLog.slice(-CONFIG.windowLogMax),
+      state: {},
+    };
+    for (const [addr, st] of state) {
+      out.state[addr] = {
+        initialPoolSize: st.initialPoolSize,
+        grails: [...st.grails].map(([id, g]) => ({ id, value: g.value, name: g.name })),
+        lastAlert: st.lastAlert,
+        wasPaused: st.wasPaused,
+        windowOpen: st.windowOpen,
+        windowOpenedAt: st.windowOpenedAt,
+        windowBestEv: st.windowBestEv,
+      };
+    }
+    fs.writeFileSync(dataFile, JSON.stringify(out));
+  } catch (e) { console.error("geheugen opslaan mislukt:", e.message); }
+}
+
+// Venster openen/sluiten registreren in de historie
+function openWindow(st, label, ev) {
+  if (st.windowOpen) { st.windowBestEv = Math.max(st.windowBestEv ?? -Infinity, ev); return; }
+  st.windowOpen = true;
+  st.windowOpenedAt = Date.now();
+  st.windowBestEv = ev;
+}
+function closeWindow(st, label) {
+  if (!st.windowOpen) return;
+  st.windowOpen = false;
+  const opened = st.windowOpenedAt || Date.now();
+  windowLog.push({
+    machine: label,
+    opened: new Date(opened).toISOString(),
+    closed: new Date().toISOString(),
+    durationMin: Math.round((Date.now() - opened) / 60000),
+    bestEv: st.windowBestEv,
+  });
+  if (windowLog.length > CONFIG.windowLogMax) windowLog = windowLog.slice(-CONFIG.windowLogMax);
+  st.windowOpenedAt = null;
+  st.windowBestEv = null;
+  saveState(true);
+}
+
+// ---------------------------------------------------------------------------
+// CHAT-BOT (grammY)
 // ---------------------------------------------------------------------------
 const bot = CONFIG.telegram.botToken ? new Bot(CONFIG.telegram.botToken) : null;
 
-// Alert sturen (door de monitor gebruikt)
 async function tg(text) {
   console.log("[ALERT]", text.replace(/<[^>]+>/g, "").replace(/\n/g, " | "));
   if (!bot || !CONFIG.telegram.chatId) return;
@@ -98,7 +180,6 @@ async function tg(text) {
   } catch (e) { console.error("telegram:", e.message); }
 }
 
-// Vind een machine op losse naam ("platinum", "gold", ...)
 function findMachine(arg) {
   if (!arg) return null;
   const a = arg.toLowerCase();
@@ -180,7 +261,7 @@ if (bot) {
       } catch { /* skip */ }
     }
     if (rows.length === 0) return ctx.reply("Geen speelbare machines nu.");
-    rows.sort((a, b) => b.evPct - a.evPct); // minst slecht eerst
+    rows.sort((a, b) => b.evPct - a.evPct);
     const top = rows[0];
     const lines = ["🎯 <b>Beste keuze nu</b>"];
     for (const r of rows) {
@@ -203,7 +284,7 @@ if (bot) {
         if (d.paused || d.items.length === 0) { lines.push(`\n<b>${m.label}</b>: niet speelbaar`); continue; }
         const s = stats(d.price, d.items);
         const breakeven = d.price / (1 - CONFIG.swapFee);
-        const gap = breakeven - s.mean; // hoeveel de gemiddelde kaart nog omhoog moet
+        const gap = breakeven - s.mean;
         if (gap <= 0) { lines.push(`\n🟢 <b>${m.label}</b>: nu al gunstig`); continue; }
         const cheap = d.items.filter((i) => i.value < s.mean).length;
         lines.push(
@@ -216,6 +297,25 @@ if (bot) {
     await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
   });
 
+  bot.command("log", async (ctx) => {
+    if (windowLog.length === 0) return ctx.reply("Nog geen vensters in de historie. Zodra er één is geweest, zie je hem hier.");
+    const recent = windowLog.slice(-10).reverse();
+    const lines = ["📜 <b>Laatste gunstige vensters</b>"];
+    for (const w of recent) {
+      const d = new Date(w.opened);
+      const dag = d.toLocaleDateString("nl-NL", { day: "numeric", month: "short" });
+      const tijd = d.toLocaleTimeString("nl-NL", { hour: "2-digit", minute: "2-digit" });
+      lines.push(`\n<b>${w.machine}</b> · ${dag} ${tijd}\n${w.durationMin} min open · best ${fmt2(w.bestEv ?? 0)}/keer`);
+    }
+    // simpel patroon: gemiddeld openingsuur
+    const uren = windowLog.map((w) => new Date(w.opened).getHours());
+    if (uren.length >= 3) {
+      const gem = Math.round(uren.reduce((a, b) => a + b, 0) / uren.length);
+      lines.push(`\nVensters openen gemiddeld rond ${gem}:00.`);
+    }
+    await ctx.reply(lines.join("\n"), { parse_mode: "HTML" });
+  });
+
   bot.command(["help", "start"], async (ctx) => {
     await ctx.reply(
       `<b>Wat ik kan</b>\n` +
@@ -223,8 +323,9 @@ if (bot) {
       `/machine platinum — alles over één machine\n` +
       `/budget 800 — wat kun je met dit bedrag, per machine\n` +
       `/best — welke is nu het minst slecht / gunstig\n` +
-      `/breakeven — hoe dicht elke machine bij gunstig is\n\n` +
-      `En je krijgt vanzelf bericht bij: gunstig moment 🟢, punten goedkoop 🪙, topkaart eruit 🎣, bijna leeg ⏳, bijvullen ⏸️🔄, nieuwe machine 🆕.`,
+      `/breakeven — hoe dicht elke machine bij gunstig is\n` +
+      `/log — laatste gunstige vensters + patroon\n\n` +
+      `En je krijgt vanzelf bericht bij: gunstig 🟢, punten goedkoop 🪙, topkaart eruit 🎣, bijna leeg ⏳, bijvullen ⏸️🔄, nieuwe machine 🆕.`,
       { parse_mode: "HTML" }
     );
   });
@@ -256,8 +357,7 @@ async function readPool(address) {
     client.readContract({ address, abi: machineAbi, functionName: "getPrizePool" }),
   ]);
   return {
-    price: usd(price),
-    finished, paused,
+    price: usd(price), finished, paused,
     items: pool.map((p) => ({ id: Number(p.tokenId), value: usd(p.swapValue) })),
   };
 }
@@ -292,9 +392,11 @@ async function initMachine(m) {
   const top = [...data.items].sort((a, b) => b.value - a.value).slice(0, CONFIG.grailTopN);
   const grails = new Map();
   for (const g of top) grails.set(g.id, { value: g.value, name: await grailName(g.id) });
-  state.set(m.address, { initialPoolSize: data.items.length, grails, lastAlert: {}, wasPaused: data.paused, windowOpen: false });
-  const s = stats(data.price, data.items);
-  console.log(`init ${m.label}: pool ${s.n}, gemiddeld ${fmt2(s.ev)}`);
+  state.set(m.address, {
+    initialPoolSize: data.items.length, grails, lastAlert: {},
+    wasPaused: data.paused, windowOpen: false, windowOpenedAt: null, windowBestEv: null,
+  });
+  console.log(`init ${m.label}: pool ${data.items.length}`);
   return data;
 }
 
@@ -310,20 +412,16 @@ async function scan(m) {
     else data = await readPool(addr);
   } catch (e) { console.error(`${m.label}: ${e.message}`); return CONFIG.pollSlowMs; }
 
-  if (data.finished || data.items.length === 0) {
-    console.log(`${m.label}: leeg`);
-    return CONFIG.pollSlowMs;
-  }
+  if (data.finished || data.items.length === 0) { console.log(`${m.label}: leeg`); return CONFIG.pollSlowMs; }
 
   if (data.paused) {
     if (!st.wasPaused) {
       st.wasPaused = true;
+      closeWindow(st, m.label);
       await tg(`⏸️ <b>${m.label} — wordt bijgevuld</b>\nSpelen kan nu niet · wijzigingen zijn van Beezie zelf\nDoen: negeren tot hij weer opengaat`);
     }
     const inPoolPaused = new Set(data.items.map((i) => i.id));
-    for (const [id, g] of st.grails) {
-      if (!inPoolPaused.has(id)) { st.grails.delete(id); console.log(`${m.label}: ⚙️ ${g.name} weg tijdens bijvullen`); }
-    }
+    for (const [id, g] of st.grails) if (!inPoolPaused.has(id)) { st.grails.delete(id); }
     return CONFIG.pollFastMs;
   }
   if (st.wasPaused) {
@@ -333,7 +431,7 @@ async function scan(m) {
     st.grails = new Map();
     for (const g of top) st.grails.set(g.id, { value: g.value, name: await grailName(g.id) });
     const sf = stats(data.price, data.items);
-    st.windowOpen = sf.ev >= CONFIG.evAlertUsd || sf.costPerPoint <= CONFIG.costPerPointAlert;
+    if (sf.ev >= CONFIG.evAlertUsd || sf.costPerPoint <= CONFIG.costPerPointAlert) openWindow(st, m.label, sf.ev);
     await tg(
       `🔄 <b>${m.label} — weer open</b>\n` +
       `Gemiddeld ${fmt2(sf.ev)}/keer · ${cppText(sf.costPerPoint)} per punt · pool ${sf.n}\n` +
@@ -353,11 +451,16 @@ async function scan(m) {
   const s = stats(data.price, data.items);
   const inPool = new Set(data.items.map((i) => i.id));
 
-  for (const [id, g] of st.grails) {
-    if (!inPool.has(id)) {
-      st.grails.delete(id);
-      const left = [...st.grails.values()].map((x) => fmtK(x.value)).join(", ") || "geen";
-      await tg(`🎣 <b>${m.label} — topkaart eruit</b>\n${g.name} (${fmtK(g.value)}) is getrokken\nNog over: ${left} · pool ${s.n} · gemiddeld ${fmt2(s.ev)}/keer`);
+  // Eerste scan na (her)start: grails stil gelijktrekken zonder valse alerts
+  if (freshStart) {
+    for (const [id] of st.grails) if (!inPool.has(id)) st.grails.delete(id);
+  } else {
+    for (const [id, g] of st.grails) {
+      if (!inPool.has(id)) {
+        st.grails.delete(id);
+        const left = [...st.grails.values()].map((x) => fmtK(x.value)).join(", ") || "geen";
+        await tg(`🎣 <b>${m.label} — topkaart eruit</b>\n${g.name} (${fmtK(g.value)}) is getrokken\nNog over: ${left} · pool ${s.n} · gemiddeld ${fmt2(s.ev)}/keer`);
+      }
     }
   }
 
@@ -365,7 +468,7 @@ async function scan(m) {
   const cpp = s.costPerPoint;
 
   if (s.ev >= CONFIG.evAlertUsd && cooldownOk(st, "ev")) {
-    st.windowOpen = true;
+    openWindow(st, m.label, s.ev);
     await tg(
       `🟢 <b>${m.label} — nu gunstig</b>\n` +
       `Gemiddeld <b>${fmt2(s.ev)}</b>/keer · ${cppText(cpp)}/punt · ${(s.winRate * 100).toFixed(0)}% kans op winst\n` +
@@ -373,10 +476,12 @@ async function scan(m) {
       `Pool ${s.n} · topkaarten nog erin ${fmtK(grailValueLeft)}\n` +
       `Doen: spelen — eerst trekken, daarna swaps afhandelen`
     );
+  } else if (s.ev >= CONFIG.evAlertUsd) {
+    openWindow(st, m.label, s.ev); // venster blijft open, beste-EV bijwerken zonder spam
   }
 
   if (s.ev < CONFIG.evAlertUsd && cpp <= CONFIG.costPerPointAlert && cooldownOk(st, "pts")) {
-    st.windowOpen = true;
+    openWindow(st, m.label, s.ev);
     await tg(
       `🪙 <b>${m.label} — punten goedkoop</b>\n` +
       `<b>${cppText(cpp)}</b> per punt · ~${Math.round(s.ptsPerLoop)} punten per keer\n` +
@@ -386,7 +491,7 @@ async function scan(m) {
   }
 
   if (st.windowOpen && s.ev < CONFIG.evAlertUsd && cpp > CONFIG.costPerPointAlert) {
-    st.windowOpen = false;
+    closeWindow(st, m.label);
     await tg(`🔒 <b>${m.label} — niet meer gunstig</b>\nGemiddeld ${fmt2(s.ev)}/keer · ${cppText(cpp)} per punt\nDoen: stoppen`);
   }
 
@@ -433,18 +538,29 @@ async function checkFactory() {
 
 async function monitorLoop() {
   console.log(`Monitor gestart — ${CONFIG.machines.length} machines\n`);
-  for (const m of CONFIG.machines) await initMachine(m).catch((e) => console.error(`init ${m.label}: ${e.message}`));
+  // machines die nog niet uit geheugen kwamen, alsnog initialiseren
+  for (const m of CONFIG.machines) {
+    if (!state.has(m.address)) await initMachine(m).catch((e) => console.error(`init ${m.label}: ${e.message}`));
+  }
   for (;;) {
     await checkFactory();
     let delay = CONFIG.pollSlowMs;
     for (const m of CONFIG.machines) delay = Math.min(delay, await scan(m));
+    freshStart = false; // na de eerste volledige ronde weer normaal alarmeren
+    saveState();
     console.log(`— volgende scan over ${Math.round(delay / 1000)}s —\n`);
     await new Promise((r) => setTimeout(r, delay));
   }
 }
 
+// schoon afsluiten: laatste stand bewaren
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => { console.log(`\n${sig} — geheugen opslaan...`); saveState(true); process.exit(0); });
+}
+
 // ---------------------------------------------------------------------------
-// START: chat-bot en monitor draaien onafhankelijk naast elkaar
+// START
 // ---------------------------------------------------------------------------
+loadState();
 if (bot) bot.start({ onStart: () => console.log("Chat-bot luistert (long polling).") });
-monitorLoop().catch((e) => { console.error(e); process.exit(1); });
+monitorLoop().catch((e) => { console.error(e); saveState(true); process.exit(1); });
