@@ -42,9 +42,10 @@ const CONFIG = {
   endgamePoolFrac: 0.45,    // near-empty alert when pool < 45% of start AND grails still in
   reAlertCooldownMs: 30 * 60_000,
 
-  pollSlowMs: 5 * 60_000,
-  pollFastMs: 15_000,
+  pollSlowMs: 12 * 60_000,  // koud: elke 12 min (was 5) — spaart de meeste calls
+  pollFastMs: 30_000,        // warm: elke 30s (was 15) — nog ruim snel genoeg voor vensters
   warmMarginUsd: 8,
+  factoryEverySlowScans: 6,  // factory pas elke 6 trage rondes checken i.p.v. elke ronde
 
   defaultBudgetUsd: 800,    // used by /budget with no argument
 
@@ -381,12 +382,16 @@ async function grailName(tokenId) {
 }
 
 async function readPool(address) {
-  const [price, finished, paused, pool] = await Promise.all([
-    client.readContract({ address, abi: machineAbi, functionName: "price" }),
-    client.readContract({ address, abi: machineAbi, functionName: "isFinished" }),
-    client.readContract({ address, abi: machineAbi, functionName: "paused" }),
-    client.readContract({ address, abi: machineAbi, functionName: "getPrizePool" }),
-  ]);
+  // Eén RPC-call i.p.v. vier: viem bundelt deze via Multicall3.
+  const [price, finished, paused, pool] = await client.multicall({
+    contracts: [
+      { address, abi: machineAbi, functionName: "price" },
+      { address, abi: machineAbi, functionName: "isFinished" },
+      { address, abi: machineAbi, functionName: "paused" },
+      { address, abi: machineAbi, functionName: "getPrizePool" },
+    ],
+    allowFailure: false,
+  });
   return {
     price: usd(price), finished, paused,
     items: pool.map((p) => ({ id: Number(p.tokenId), value: usd(p.swapValue) })),
@@ -571,10 +576,15 @@ async function monitorLoop() {
   for (const m of CONFIG.machines) {
     if (!state.has(m.address)) await initMachine(m).catch((e) => console.error(`init ${m.label}: ${e.message}`));
   }
+  let slowScanCount = 0;
   for (;;) {
-    await checkFactory();
     let delay = CONFIG.pollSlowMs;
     for (const m of CONFIG.machines) delay = Math.min(delay, await scan(m));
+    // Factory alleen checken als alles koud is, en dan nog maar elke zoveelste ronde.
+    if (delay >= CONFIG.pollSlowMs) {
+      if (slowScanCount % CONFIG.factoryEverySlowScans === 0) await checkFactory();
+      slowScanCount++;
+    }
     freshStart = false;
     saveState();
     console.log(`— next scan in ${Math.round(delay / 1000)}s —\n`);
